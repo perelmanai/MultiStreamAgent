@@ -87,10 +87,8 @@ class GeminiBackend(Backend):
         self._model_key = model_key or GEMINI_DEFAULT_MODEL
 
     def generate(self, question: str, history: list[dict]) -> str:
-        import time
         from gemini_client import generate_gemini_response
 
-        time.sleep(10)
         return generate_gemini_response(
             model_key=self._model_key,
             user_text=question,
