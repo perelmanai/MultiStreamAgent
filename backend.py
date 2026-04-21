@@ -9,7 +9,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from . import models
+import models
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,39 @@ class LocalBackend(Backend):
             models.unload_model(self._model_handle)
             self._model_handle = None
             self._model_key = None
+
+    @property
+    def model_key(self) -> str | None:
+        return self._model_key
+
+
+class GeminiBackend(Backend):
+    """Backend using Gemini API."""
+
+    def __init__(self, model_key: str | None = None):
+        from gemini_client import GEMINI_DEFAULT_MODEL
+
+        self._model_key = model_key or GEMINI_DEFAULT_MODEL
+
+    def generate(self, question: str, history: list[dict]) -> str:
+        import time
+        from gemini_client import generate_gemini_response
+
+        time.sleep(10)
+        return generate_gemini_response(
+            model_key=self._model_key,
+            user_text=question,
+            history=history,
+            system_prompt=models.BACKEND_SYSTEM_PROMPT,
+            max_tokens=1024,
+        )
+
+    def load_model(self, model_key: str) -> None:
+        logger.info("GeminiBackend switching to model: %s", model_key)
+        self._model_key = model_key
+
+    def unload_model(self) -> None:
+        pass
 
     @property
     def model_key(self) -> str | None:

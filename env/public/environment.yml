@@ -1,0 +1,23 @@
+name: multi_stream_agent
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy=1.26.4
+
+  # PyTorch with CUDA 12.4
+  - pytorch::pytorch=2.5.*
+  - pytorch::torchaudio=2.5.*
+  - pytorch::pytorch-cuda=12.4
+
+  - pip:
+    - transformers>=4.43.0
+    - huggingface-hub
+    - safetensors
+    - accelerate
+    - gradio
+    - google-genai
