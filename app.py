@@ -15,6 +15,10 @@ import sys
 import threading
 import time
 
+import numpy as np
+import torch
+import torchaudio
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 import gradio as gr
@@ -58,6 +62,73 @@ frontend_gemini_model: str = GEMINI_DEFAULT_MODEL
 # Maps backend item ID → history index where the deferral message was placed.
 # Used to insert the backend answer at the correct position in the conversation.
 backend_insert_positions: dict[str, int] = {}
+
+whisper_handle = None
+whisper_lock = threading.Lock()
+
+WHISPER_MODEL_PATH = os.path.expanduser(
+    "~/si_mango/tree/checkpoints/whisper/large-v3-turbo.pt"
+)
+WHISPER_SAMPLE_RATE = 16000
+
+
+def load_whisper(model_path: str = WHISPER_MODEL_PATH):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if model_path.endswith((".pt", ".pth")):
+        import whisper
+
+        model = whisper.load_model(model_path, device=device)
+        return model, "openai", device
+    else:
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+        processor = WhisperProcessor.from_pretrained(model_path)
+        model = WhisperForConditionalGeneration.from_pretrained(
+            model_path, torch_dtype=torch.float16
+        ).to(device)
+        return (model, processor), "hf", device
+
+
+def get_whisper():
+    global whisper_handle
+    if whisper_handle is None:
+        with whisper_lock:
+            if whisper_handle is None:
+                logger.info("Loading Whisper model from %s", WHISPER_MODEL_PATH)
+                whisper_handle = load_whisper()
+                logger.info("Whisper model loaded")
+    return whisper_handle
+
+
+def transcribe_audio(whisper_h, audio_np: np.ndarray) -> str:
+    model, fmt, device = whisper_h
+
+    if fmt == "openai":
+        import whisper
+
+        result = whisper.transcribe(model, audio_np)
+        return result["text"].strip()
+    else:
+        hf_model, processor = model
+        input_features = processor(
+            audio_np, sampling_rate=WHISPER_SAMPLE_RATE, return_tensors="pt"
+        ).input_features.to(device, torch.float16)
+        with torch.no_grad():
+            predicted_ids = hf_model.generate(input_features)
+        return processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+
+
+def preprocess_audio(sr: int, audio_data: np.ndarray) -> np.ndarray:
+    if audio_data.dtype != np.float32:
+        audio_data = audio_data.astype(np.float32) / np.iinfo(audio_data.dtype).max
+    if audio_data.ndim > 1:
+        audio_data = audio_data.mean(axis=1)
+    if sr != WHISPER_SAMPLE_RATE:
+        audio_tensor = torch.from_numpy(audio_data).unsqueeze(0)
+        audio_tensor = torchaudio.functional.resample(audio_tensor, sr, WHISPER_SAMPLE_RATE)
+        audio_data = audio_tensor.squeeze(0).numpy()
+    return audio_data
+
 
 STATUS_COLORS = {
     "queued": ("#999", "Queued"),
@@ -404,6 +475,43 @@ def on_backend_gemini_model_change(model_key: str, history: list[dict]):
     return history, render_queue_html()
 
 
+def on_input_mode_change(mode: str):
+    return (
+        gr.update(visible=mode == "Text"),
+        gr.update(visible=mode == "Speech"),
+    )
+
+
+def on_audio_record(
+    audio_data,
+    history: list[dict],
+    threshold_n: int,
+    streaming_enabled: bool,
+    num_words_delay: int,
+):
+    """Called when the user finishes recording via gr.Audio. Transcribes and auto-sends."""
+    if audio_data is None:
+        yield history, gr.update(value="Ready to record"), None, render_queue_html()
+        return
+
+    sr, data = audio_data
+    yield history, gr.update(value="Transcribing..."), None, render_queue_html()
+
+    audio_np = preprocess_audio(sr, data)
+    wh = get_whisper()
+    transcript = transcribe_audio(wh, audio_np)
+    logger.info("Whisper transcript: %s", transcript)
+
+    if not transcript.strip():
+        yield history, gr.update(value="(no speech detected)"), None, render_queue_html()
+        return
+
+    for hist_update, _, queue_update in on_user_message(
+        transcript, history, threshold_n, streaming_enabled, num_words_delay
+    ):
+        yield hist_update, gr.update(value=f"Sent: {transcript[:80]}"), None, queue_update
+
+
 def on_clear():
     if backend_worker is not None:
         backend_worker.clear_items()
@@ -498,13 +606,30 @@ def main():
                     height=500,
                     label="Chat",
                 )
-                with gr.Row():
+                input_mode_radio = gr.Radio(
+                    choices=["Text", "Speech"],
+                    value="Text",
+                    label="Input Mode",
+                    interactive=True,
+                )
+                with gr.Row(visible=True) as text_input_group:
                     text_input = gr.Textbox(
                         placeholder="Type your message...",
                         show_label=False,
                         scale=4,
                     )
                     send_btn = gr.Button("Send", variant="primary", scale=1)
+                with gr.Column(visible=False) as speech_input_group:
+                    audio_input = gr.Audio(
+                        sources=["microphone"],
+                        type="numpy",
+                        label="Record your message",
+                    )
+                    speech_status = gr.Textbox(
+                        label="Status",
+                        interactive=False,
+                        value="Click the microphone to record, click again to stop",
+                    )
 
         # --- Events ---
         msg_inputs = [
@@ -517,6 +642,20 @@ def main():
         msg_outputs = [chatbot, text_input, queue_html]
         send_btn.click(fn=on_user_message, inputs=msg_inputs, outputs=msg_outputs)
         text_input.submit(fn=on_user_message, inputs=msg_inputs, outputs=msg_outputs)
+
+        # Input mode switching
+        input_mode_radio.change(
+            fn=on_input_mode_change,
+            inputs=[input_mode_radio],
+            outputs=[text_input_group, speech_input_group],
+        )
+
+        # Speech: when recording stops, transcribe and auto-send
+        audio_input.stop_recording(
+            fn=on_audio_record,
+            inputs=[audio_input, chatbot, threshold_slider, streaming_toggle, words_delay_slider],
+            outputs=[chatbot, speech_status, audio_input, queue_html],
+        )
 
         timer = gr.Timer(value=2)
         timer.tick(fn=poll_backend, inputs=[chatbot], outputs=[chatbot, queue_html])
