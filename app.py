@@ -15,15 +15,19 @@ import sys
 import threading
 import time
 
-import numpy as np
-import torch
-import torchaudio
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 import gradio as gr
 
-from backend import BackendWorker, GeminiBackend, LocalBackend
+from backend import (
+    DEFAULT_ASR,
+    BackendWorker,
+    GeminiASRBackend,
+    GeminiBackend,
+    LocalBackend,
+    WhisperASRBackend,
+    get_asr_choices,
+)
 from gemini_client import (
     GEMINI_DEFAULT_MODEL,
     estimate_complexity_gemini,
@@ -63,72 +67,7 @@ frontend_gemini_model: str = GEMINI_DEFAULT_MODEL
 # Used to insert the backend answer at the correct position in the conversation.
 backend_insert_positions: dict[str, int] = {}
 
-whisper_handle = None
-whisper_lock = threading.Lock()
-
-WHISPER_MODEL_PATH = os.path.expanduser(
-    "~/si_mango/tree/checkpoints/whisper/large-v3-turbo.pt"
-)
-WHISPER_SAMPLE_RATE = 16000
-
-
-def load_whisper(model_path: str = WHISPER_MODEL_PATH):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if model_path.endswith((".pt", ".pth")):
-        import whisper
-
-        model = whisper.load_model(model_path, device=device)
-        return model, "openai", device
-    else:
-        from transformers import WhisperForConditionalGeneration, WhisperProcessor
-
-        processor = WhisperProcessor.from_pretrained(model_path)
-        model = WhisperForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.float16
-        ).to(device)
-        return (model, processor), "hf", device
-
-
-def get_whisper():
-    global whisper_handle
-    if whisper_handle is None:
-        with whisper_lock:
-            if whisper_handle is None:
-                logger.info("Loading Whisper model from %s", WHISPER_MODEL_PATH)
-                whisper_handle = load_whisper()
-                logger.info("Whisper model loaded")
-    return whisper_handle
-
-
-def transcribe_audio(whisper_h, audio_np: np.ndarray) -> str:
-    model, fmt, device = whisper_h
-
-    if fmt == "openai":
-        import whisper
-
-        result = whisper.transcribe(model, audio_np)
-        return result["text"].strip()
-    else:
-        hf_model, processor = model
-        input_features = processor(
-            audio_np, sampling_rate=WHISPER_SAMPLE_RATE, return_tensors="pt"
-        ).input_features.to(device, torch.float16)
-        with torch.no_grad():
-            predicted_ids = hf_model.generate(input_features)
-        return processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
-
-
-def preprocess_audio(sr: int, audio_data: np.ndarray) -> np.ndarray:
-    if audio_data.dtype != np.float32:
-        audio_data = audio_data.astype(np.float32) / np.iinfo(audio_data.dtype).max
-    if audio_data.ndim > 1:
-        audio_data = audio_data.mean(axis=1)
-    if sr != WHISPER_SAMPLE_RATE:
-        audio_tensor = torch.from_numpy(audio_data).unsqueeze(0)
-        audio_tensor = torchaudio.functional.resample(audio_tensor, sr, WHISPER_SAMPLE_RATE)
-        audio_data = audio_tensor.squeeze(0).numpy()
-    return audio_data
-
+asr_engine = WhisperASRBackend()
 
 STATUS_COLORS = {
     "queued": ("#999", "Queued"),
@@ -482,6 +421,23 @@ def on_input_mode_change(mode: str):
     )
 
 
+def on_asr_change(asr_choice: str, gemini_model_key: str):
+    global asr_engine
+    if asr_choice == "Gemini ASR":
+        asr_engine = GeminiASRBackend(model_key=gemini_model_key)
+    else:
+        asr_engine = WhisperASRBackend()
+    logger.info("ASR switched to %s", asr_choice)
+    return gr.update(visible=asr_choice == "Gemini ASR")
+
+
+def on_asr_gemini_model_change(model_key: str):
+    global asr_engine
+    if isinstance(asr_engine, GeminiASRBackend):
+        asr_engine.model_key = model_key
+        logger.info("ASR Gemini model switched to %s", model_key)
+
+
 def on_audio_record(
     audio_data,
     history: list[dict],
@@ -489,7 +445,6 @@ def on_audio_record(
     streaming_enabled: bool,
     num_words_delay: int,
 ):
-    """Called when the user finishes recording via gr.Audio. Transcribes and auto-sends."""
     if audio_data is None:
         yield history, gr.update(value="Ready to record"), None, render_queue_html()
         return
@@ -497,10 +452,8 @@ def on_audio_record(
     sr, data = audio_data
     yield history, gr.update(value="Transcribing..."), None, render_queue_html()
 
-    audio_np = preprocess_audio(sr, data)
-    wh = get_whisper()
-    transcript = transcribe_audio(wh, audio_np)
-    logger.info("Whisper transcript: %s", transcript)
+    transcript = asr_engine.transcribe(sr, data)
+    logger.info("ASR transcript: %s", transcript)
 
     if not transcript.strip():
         yield history, gr.update(value="(no speech detected)"), None, render_queue_html()
@@ -574,6 +527,19 @@ def main():
                         choices=gemini_model_names,
                         value=GEMINI_DEFAULT_MODEL,
                         label="Backend Model (Gemini)",
+                    )
+
+                gr.Markdown("### ASR Settings")
+                asr_radio = gr.Radio(
+                    choices=get_asr_choices(),
+                    value=DEFAULT_ASR,
+                    label="ASR Backend",
+                )
+                with gr.Column(visible=False) as asr_gemini_group:
+                    asr_gemini_dropdown = gr.Dropdown(
+                        choices=gemini_model_names,
+                        value=GEMINI_DEFAULT_MODEL,
+                        label="ASR Gemini Model",
                     )
 
                 gr.Markdown("### General")
@@ -675,6 +641,17 @@ def main():
             fn=on_frontend_gemini_model_change,
             inputs=[fe_gemini_dropdown, chatbot],
             outputs=[chatbot, queue_html],
+        )
+
+        # ASR switching
+        asr_radio.change(
+            fn=on_asr_change,
+            inputs=[asr_radio, asr_gemini_dropdown],
+            outputs=[asr_gemini_group],
+        )
+        asr_gemini_dropdown.change(
+            fn=on_asr_gemini_model_change,
+            inputs=[asr_gemini_dropdown],
         )
 
         # Backend switching
