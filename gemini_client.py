@@ -111,7 +111,7 @@ def generate_gemini_response_streaming(
     user_text: str,
     history: list[dict],
     system_prompt: str,
-    max_tokens: int = 256,
+    max_tokens: int = 2048,
     num_words_delay: int = 3,
 ) -> Generator[str, None, None]:
     client = _get_client()
