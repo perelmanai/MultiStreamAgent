@@ -27,6 +27,7 @@ from client import (
     TTSQueueWorker,
     TTSSource,
     estimate_complexity_gemini,
+    estimate_intention_gemini,
     generate_gemini_response,
     generate_gemini_response_streaming,
 )
@@ -71,6 +72,9 @@ class Orchestrator:
         self.frontend_type: str = "Gemini API"
         self.frontend_gemini_model: str = GEMINI_DEFAULT_MODEL
         self.backend_insert_positions: dict[str, int] = {}
+        self._ready_items: dict[str, QueueItem] = {}
+        self._ready_audio: dict[str, str] = {}
+        self._pending_notifications: dict[str, dict] = {}
 
         self.asr_engine = LocalASRClient()
         self.tts_engine: GeminiTTSClient = GeminiTTSClient()
@@ -185,6 +189,20 @@ class Orchestrator:
         final_text = None
 
         if using_gemini:
+            ready_for_intent = self._get_ready_items_for_intent()
+            if ready_for_intent:
+                intention = estimate_intention_gemini(
+                    model_key=self.frontend_gemini_model,
+                    user_text=user_text,
+                    history=history,
+                    ready_items=ready_for_intent,
+                )
+                if intention["action"] == "SELECT":
+                    answer_text, audio_path = self._deliver_ready_item(intention["index"], history)
+                    if answer_text:
+                        yield self._make_update(history, clear_input=True, audio_path=audio_path)
+                        return
+
             is_complex, est_words, summary = self._gemini_triage(user_text, threshold_n)
 
             if is_complex:
@@ -268,50 +286,97 @@ class Orchestrator:
             self._maybe_enqueue_tts(final_text, TTSSource.FRONTEND)
             yield self._make_update(history, clear_input=True)
 
+    def _append_notification(self, history: list[dict], notification: str) -> None:
+        history.append({"role": "assistant", "content": notification})
+
     def poll(self, history: list[dict]) -> OrchestratorUpdate:
         audio_path = None
 
         if self.backend_worker is not None:
             results = self.backend_worker.get_results()
             for item in results:
-                t0 = time.time()
-                logger.info("poll_backend: picked up item %s", item.id)
+                logger.info("poll_backend: item %s ready", item.id)
+                self._ready_items[item.id] = item
+                self.backend_insert_positions.pop(item.id, None)
 
-                delivery = (
-                    f"Regarding your earlier question about **{item.context_summary}**:\n\n"
-                    f"{item.answer}"
+                notification = (
+                    f"I've finished working on your question about "
+                    f"**{item.context_summary}**. Would you like to hear the answer?"
                 )
 
-                insert_idx = self.backend_insert_positions.pop(item.id, None)
-                if insert_idx is not None and insert_idx <= len(history):
-                    history.insert(insert_idx, {"role": "assistant", "content": delivery})
-                    for k, v in self.backend_insert_positions.items():
-                        if v >= insert_idx:
-                            self.backend_insert_positions[k] = v + 1
+                if self.output_mode == "Speech" and self.tts_queue_worker is not None:
+                    tts_item = self.tts_queue_worker.submit(
+                        item.answer, source=TTSSource.BACKEND
+                    )
+                    self._pending_notifications[tts_item.id] = {
+                        "text": notification,
+                        "item_id": item.id,
+                    }
+                    logger.info(
+                        "Answer TTS enqueued %s for item %s (notification pending)",
+                        tts_item.id, item.id,
+                    )
                 else:
-                    if history and history[-1]["role"] == "assistant":
-                        history.append(
-                            {"role": "user", "content": f"[Completed: {item.context_summary}]"}
-                        )
-                    history.append({"role": "assistant", "content": delivery})
-
-                self.backend_worker.mark_delivered(item.id)
-                self._maybe_enqueue_tts(item.answer, TTSSource.BACKEND)
-                logger.info(
-                    "poll_backend: item %s delivered (%.2fs)", item.id, time.time() - t0
-                )
+                    self._append_notification(history, notification)
 
         if self.tts_queue_worker is not None:
             tts_item = self.tts_queue_worker.get_next_audio()
             if tts_item is not None:
-                if tts_item.audio_path:
-                    audio_path = tts_item.audio_path
+                if tts_item.id in self._pending_notifications:
+                    info = self._pending_notifications.pop(tts_item.id)
+                    if tts_item.audio_path:
+                        self._ready_audio[info["item_id"]] = tts_item.audio_path
+                    self._append_notification(history, info["text"])
+                    self.tts_queue_worker.submit(
+                        info["text"], source=TTSSource.BACKEND
+                    )
+                    logger.info(
+                        "Answer speech ready — notification sent for item %s, "
+                        "audio stored for SELECT",
+                        info["item_id"],
+                    )
+                else:
+                    if tts_item.audio_path:
+                        audio_path = tts_item.audio_path
                 self.tts_queue_worker.mark_delivered(tts_item.id)
                 logger.info(
                     "TTS item %s delivered (%.1fs)", tts_item.id, tts_item.audio_duration
                 )
 
         return self._make_update(history, audio_path=audio_path)
+
+    def _get_ready_items_for_intent(self) -> list[dict]:
+        """Build the ready-items list for intention estimation."""
+        return [
+            {
+                "index": idx,
+                "id": item.id,
+                "question": item.question,
+                "summary": item.context_summary,
+            }
+            for idx, item in enumerate(self._ready_items.values())
+        ]
+
+    def _deliver_ready_item(self, index: int, history: list[dict]) -> tuple[str | None, str | None]:
+        """Deliver a ready item by index. Returns (answer_text, audio_path)."""
+        items_list = list(self._ready_items.values())
+        if index < 0 or index >= len(items_list):
+            return None, None
+        item = items_list[index]
+
+        delivery = (
+            f"Regarding your question about **{item.context_summary}**:\n\n"
+            f"{item.answer}"
+        )
+        history.append({"role": "assistant", "content": delivery})
+
+        audio_path = self._ready_audio.pop(item.id, None)
+
+        if self.backend_worker is not None:
+            self.backend_worker.mark_delivered(item.id)
+        del self._ready_items[item.id]
+        logger.info("Delivered ready item %s (index %d, audio=%s)", item.id, index, audio_path is not None)
+        return item.answer, audio_path
 
     def handle_audio_input(
         self,
@@ -346,6 +411,9 @@ class Orchestrator:
             self.backend_worker.clear_items()
         if self.tts_queue_worker is not None:
             self.tts_queue_worker.clear_items()
+        self._ready_items.clear()
+        self._ready_audio.clear()
+        self._pending_notifications.clear()
         return self._make_update([])
 
     # ------------------------------------------------------------------

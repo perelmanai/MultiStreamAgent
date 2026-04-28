@@ -20,9 +20,7 @@ GEMINI_DEFAULT_MODEL = "Gemini-3-Flash"
 def _get_client() -> genai.Client:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY not set. Export it or use env/fb/run.sh."
-        )
+        raise RuntimeError("GEMINI_API_KEY not set. Export it or use env/fb/run.sh.")
     return genai.Client(api_key=api_key)
 
 
@@ -160,3 +158,77 @@ def estimate_complexity_gemini(
         ),
     )
     return response.text
+
+
+def estimate_intention_gemini(
+    model_key: str,
+    user_text: str,
+    history: list[dict],
+    ready_items: list[dict],
+) -> dict:
+    """Decide whether the user wants to SELECT a ready answer or GENERATE a new one.
+
+    Args:
+        model_key: Gemini model key.
+        user_text: The latest user message.
+        history: Conversation history.
+        ready_items: List of dicts with keys "index", "question", "summary"
+                     representing backend answers waiting for delivery.
+
+    Returns:
+        {"action": "SELECT", "index": <int>} or {"action": "GENERATE"}
+    """
+    items_desc = "\n".join(
+        f"  [{i['index']}] \"{i['question'][:120]}\" (topic: {i['summary']})"
+        for i in ready_items
+    )
+
+    system_instruction = (
+        "You are an intent classifier for a voice assistant. "
+        "The user is chatting with an assistant that processes complex questions in the background. "
+        "Some answers are now ready and waiting to be delivered.\n\n"
+        "Ready answers:\n"
+        f"{items_desc}\n\n"
+        "Based on the user's latest message and conversation context, decide:\n"
+        "- If the user is asking to hear, see, read, or retrieve one of the ready answers "
+        "(e.g. 'yes', 'sure', 'tell me', 'what about that question', 'read it', referencing a topic), "
+        "reply: SELECT <index>\n"
+        "- If the user is asking a new question or continuing the conversation on a different topic, "
+        "reply: GENERATE\n\n"
+        "Reply with ONLY one line: either 'SELECT <index>' or 'GENERATE'. Nothing else."
+    )
+
+    recent_history = history[-6:] if len(history) > 6 else history
+    contents = _build_contents(recent_history, user_text)
+
+    client = _get_client()
+    model_name = GEMINI_MODELS[model_key]
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            max_output_tokens=32,
+            temperature=0.1,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        ),
+    )
+
+    raw = response.text.strip()
+    logger.info("estimate_intention raw: %s | ready_items: %s | user: %s", raw, items_desc, user_text)
+
+    if raw.upper().startswith("SELECT"):
+        parts = raw.split()
+        if len(parts) >= 2:
+            try:
+                idx = int(parts[1])
+                valid_indices = [i["index"] for i in ready_items]
+                if idx in valid_indices:
+                    return {"action": "SELECT", "index": idx}
+            except ValueError:
+                pass
+        if ready_items:
+            return {"action": "SELECT", "index": ready_items[0]["index"]}
+
+    return {"action": "GENERATE"}

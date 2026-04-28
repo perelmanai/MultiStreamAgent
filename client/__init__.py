@@ -12,6 +12,7 @@ from .base import (
 from .gemini_utils import (
     GEMINI_DEFAULT_MODEL,
     estimate_complexity_gemini,
+    estimate_intention_gemini,
     generate_gemini_response,
     generate_gemini_response_streaming,
     get_gemini_model_names,
@@ -38,6 +39,7 @@ __all__ = [
     "TTSQueueWorker",
     "TTSSource",
     "estimate_complexity_gemini",
+    "estimate_intention_gemini",
     "generate_gemini_response",
     "generate_gemini_response_streaming",
     "get_asr_choices",

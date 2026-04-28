@@ -110,8 +110,6 @@ class TTSQueueWorker:
         self._items: dict[str, TTSQueueItem] = {}
         self._lock = threading.Lock()
         self._pool: concurrent.futures.ThreadPoolExecutor | None = None
-        self._last_delivered_at: float = 0.0
-        self._last_delivered_duration: float = 0.0
 
     def start(self) -> None:
         if self._pool is not None:
@@ -166,10 +164,13 @@ class TTSQueueWorker:
         return item
 
     def get_next_audio(self) -> TTSQueueItem | None:
-        now = time.time()
-        if now < self._last_delivered_at + self._last_delivered_duration:
-            return None
+        """Return the next completed TTS item, or None.
 
+        Immediate (frontend) items take priority. Backend items are only
+        served when no immediate items are pending.  The caller is
+        responsible for blocking on playback state — this method does
+        not track playback timing.
+        """
         item: TTSQueueItem | None = None
         try:
             item = self._immediate_result_queue.get_nowait()
@@ -179,10 +180,6 @@ class TTSQueueWorker:
                     item = self._backend_result_queue.get_nowait()
                 except queue.Empty:
                     pass
-
-        if item is not None and item.audio_path:
-            self._last_delivered_at = now
-            self._last_delivered_duration = item.audio_duration
         return item
 
     def has_pending_immediate(self) -> bool:
@@ -204,8 +201,6 @@ class TTSQueueWorker:
     def clear_items(self) -> None:
         with self._lock:
             self._items.clear()
-        self._last_delivered_at = 0.0
-        self._last_delivered_duration = 0.0
         for q in (self._immediate_result_queue, self._backend_result_queue):
             while not q.empty():
                 try:

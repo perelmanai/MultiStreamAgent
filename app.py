@@ -250,15 +250,19 @@ def on_user_message(
         )
 
 
-def poll_backend_and_tts(history: list[dict]):
+def poll_backend_and_tts(history: list[dict], audio_flag: str):
     update = orch.poll(history)
+    is_playing = audio_flag == "playing"
+    audio_out = gr.update()
+    if update.audio_path and not is_playing:
+        audio_out = update.audio_path
     return (
         update.history,
         gr.update(value=f"Text Queue ({update.text_queue_count})"),
         gr.update(value=f"Speech Queue ({update.speech_queue_count})"),
         render_text_queue_html(),
         render_speech_queue_html(),
-        update.audio_path if update.audio_path else gr.update(),
+        audio_out,
     )
 
 
@@ -388,7 +392,40 @@ def main():
     local_model_names = get_model_names()
     gemini_model_names = get_gemini_model_names()
 
-    with gr.Blocks(title="Multi-Stream Conversation", css=QUEUE_PANEL_CSS) as demo:
+    audio_tracking_js = """
+    () => {
+        function setFlag(val) {
+            const flag = document.querySelector('#audio-playing-flag textarea');
+            if (flag && flag.value !== val) {
+                flag.value = val;
+                flag.dispatchEvent(new Event('input', {bubbles: true}));
+            }
+        }
+        function hookAudio(audio) {
+            if (!audio || audio._tts_hooked) return;
+            audio._tts_hooked = true;
+            audio.addEventListener('play', () => setFlag('playing'));
+            audio.addEventListener('pause', () => setFlag('idle'));
+            audio.addEventListener('ended', () => setFlag('idle'));
+        }
+        // Re-hook whenever Gradio replaces the <audio> element
+        const observer = new MutationObserver(() => {
+            const container = document.getElementById('tts-audio-output');
+            if (!container) return;
+            const audio = container.querySelector('audio');
+            hookAudio(audio);
+        });
+        const waitForContainer = setInterval(() => {
+            const container = document.getElementById('tts-audio-output');
+            if (!container) return;
+            clearInterval(waitForContainer);
+            observer.observe(container, {childList: true, subtree: true});
+            hookAudio(container.querySelector('audio'));
+        }, 300);
+    }
+    """
+
+    with gr.Blocks(title="Multi-Stream Conversation", css=QUEUE_PANEL_CSS, js=audio_tracking_js) as demo:
         gr.Markdown(
             "# Multi-Stream Conversation\nFront-end triage + back-end deep processing"
         )
@@ -507,6 +544,10 @@ def main():
                 audio_output = gr.Audio(
                     label="TTS Output",
                     autoplay=True,
+                    elem_id="tts-audio-output",
+                )
+                audio_playing_flag = gr.Textbox(
+                    value="idle", visible=False, elem_id="audio-playing-flag",
                 )
                 with gr.Row(visible=True) as text_input_group:
                     text_input = gr.Textbox(
@@ -626,7 +667,7 @@ def main():
         timer = gr.Timer(value=2)
         timer.tick(
             fn=poll_backend_and_tts,
-            inputs=[chatbot],
+            inputs=[chatbot, audio_playing_flag],
             outputs=[
                 chatbot,
                 text_queue_btn,
