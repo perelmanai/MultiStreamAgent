@@ -28,3 +28,8 @@ ssh -L 7863:localhost:7863 <user>@<devgpu>
 # Open http://localhost:7863
 ```
 
+## TODO
+
+- [ ] Add logic for choosing between actions: select and generate
+- [ ] Refactor into orchestrator
+
