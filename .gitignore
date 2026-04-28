@@ -1,3 +1,5 @@
 __pycache__/
+env/fb/
 .gradio/
 *.profraw
+CLAUDE.md

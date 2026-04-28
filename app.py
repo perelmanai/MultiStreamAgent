@@ -354,6 +354,7 @@ def on_user_message(
             )
             history.append({"role": "assistant", "content": reply})
             backend_insert_positions[item.id] = len(history)
+            _maybe_enqueue_tts(reply, TTSSource.FRONTEND)
             t_btn, s_btn, t_html, s_html = _q_updates()
             yield history, "", t_btn, s_btn, t_html, s_html, no_audio
         elif streaming_enabled:
@@ -400,6 +401,7 @@ def on_user_message(
             )
             history.append({"role": "assistant", "content": reply})
             backend_insert_positions[item.id] = len(history)
+            _maybe_enqueue_tts(reply, TTSSource.FRONTEND)
             t_btn, s_btn, t_html, s_html = _q_updates()
             yield history, "", t_btn, s_btn, t_html, s_html, no_audio
         elif direct_answer:
