@@ -30,6 +30,7 @@ from backend import (
     GeminiTTSBackend,
     LocalBackend,
     TTSQueueWorker,
+    TTSSource,
     WhisperASRBackend,
     get_asr_choices,
 )
@@ -167,14 +168,21 @@ QUEUE_PANEL_CSS = """
 """
 
 
-def _render_item_html(text: str, status: str) -> str:
+def _render_item_html(text: str, status: str, source_tag: str = "") -> str:
     color, label = STATUS_COLORS.get(status, ("#999", "Unknown"))
     escaped = html.escape(text)
+    tag_html = ""
+    if source_tag:
+        tag_html = (
+            f' <span style="font-size:0.75em;color:#fff;background:'
+            f'{"#337ab7" if source_tag == "frontend" else "#8e44ad"};'
+            f'border-radius:3px;padding:1px 5px;">{source_tag}</span>'
+        )
     return (
         f'<div class="queue-item status-{status}">'
         f'<div class="queue-item-header">'
         f'<span class="status-dot" style="background:{color};"></span>'
-        f'<span class="status-label">[{label}]</span>'
+        f'<span class="status-label">[{label}]</span>{tag_html}'
         f'</div>'
         f'<div class="queue-item-text">{escaped}</div>'
         f'</div>'
@@ -250,7 +258,7 @@ def render_speech_queue_html() -> str:
     items_sorted = sorted(items, key=lambda x: x.timestamp)
     items_html = ""
     for item in items_sorted:
-        items_html += _render_item_html(item.text, item.status)
+        items_html += _render_item_html(item.text, item.status, item.source.value)
 
     return (
         f'<div style="padding:0 4px;">'
@@ -274,11 +282,11 @@ def _gemini_triage(user_text: str, threshold_n: int):
     return estimated_words >= threshold_n, estimated_words, user_text[:80]
 
 
-def _maybe_enqueue_tts(text: str) -> None:
+def _maybe_enqueue_tts(text: str, source: TTSSource) -> None:
     """If output mode is Speech, enqueue text for TTS synthesis."""
     if output_mode != "Speech" or tts_queue_worker is None:
         return
-    tts_queue_worker.submit(text)
+    tts_queue_worker.submit(text, source=source)
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +314,17 @@ def on_user_message(
     if not user_text.strip():
         t_btn, s_btn, t_html, s_html = _q_updates()
         yield history, "", t_btn, s_btn, t_html, s_html, no_audio
+        return
+
+    if (
+        tts_queue_worker is not None
+        and tts_queue_worker.has_pending_immediate()
+    ):
+        gr.Warning(
+            "Please wait — the previous reply is still being spoken. "
+            "You can send a new message once TTS playback is ready."
+        )
+        yield history, user_text, gr.update(), gr.update(), gr.update(), gr.update(), no_audio
         return
 
     using_gemini_frontend = frontend_type == "Gemini API"
@@ -406,7 +425,7 @@ def on_user_message(
             yield history, "", t_btn, s_btn, t_html, s_html, no_audio
 
     if final_text:
-        _maybe_enqueue_tts(final_text)
+        _maybe_enqueue_tts(final_text, TTSSource.FRONTEND)
         t_btn, s_btn, t_html, s_html = _q_updates()
         yield history, "", t_btn, s_btn, t_html, s_html, no_audio
 
@@ -441,17 +460,17 @@ def poll_backend_and_tts(history: list[dict]):
                 history.append({"role": "assistant", "content": delivery})
 
             backend_worker.mark_delivered(item.id)
-            _maybe_enqueue_tts(item.answer)
+            _maybe_enqueue_tts(item.answer, TTSSource.BACKEND)
             logger.info("poll_backend: item %s delivered (%.2fs)", item.id, time.time() - t0)
 
-    # --- TTS queue results ---
+    # --- TTS queue results (one at a time to avoid cutting off playback) ---
     if tts_queue_worker is not None:
-        tts_results = tts_queue_worker.get_results()
-        for tts_item in tts_results:
+        tts_item = tts_queue_worker.get_next_audio()
+        if tts_item is not None:
             if tts_item.audio_path:
                 audio_out = tts_item.audio_path
             tts_queue_worker.mark_delivered(tts_item.id)
-            logger.info("TTS item %s delivered", tts_item.id)
+            logger.info("TTS item %s delivered (%.1fs)", tts_item.id, tts_item.audio_duration)
 
     return (
         history,

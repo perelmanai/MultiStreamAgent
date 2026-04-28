@@ -15,6 +15,7 @@ from .tts_backend import (
     TTSBackend,
     TTSQueueItem,
     TTSQueueWorker,
+    TTSSource,
 )
 
 # Backward-compatible alias
@@ -36,6 +37,7 @@ __all__ = [
     "TTSBackend",
     "TTSQueueItem",
     "TTSQueueWorker",
+    "TTSSource",
     "WhisperASRBackend",
     "get_asr_choices",
 ]
