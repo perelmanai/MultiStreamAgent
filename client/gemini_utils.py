@@ -1,4 +1,4 @@
-"""Gemini API client for multi-stream conversation."""
+"""Gemini API utilities for multi-stream conversation."""
 
 import logging
 import os
@@ -31,7 +31,7 @@ def get_gemini_model_names() -> list[str]:
 
 
 def _extract_text(content) -> str:
-    """Extract plain text from a Gradio message content field.
+    """Extract plain text from a message content field.
 
     Content can be a plain string or a list of dicts like
     [{"text": "...", "type": "text"}].
@@ -70,7 +70,6 @@ def _build_contents(
         else:
             contents.append(types.Content(role=role, parts=[types.Part(text=text)]))
 
-    # Gemini needs the conversation to end with a user turn
     if contents and contents[-1].role == "user":
         existing_text = contents[-1].parts[0].text
         contents[-1] = types.Content(

@@ -1,69 +1,109 @@
-"""Base classes and shared types for backend providers."""
+"""LLM clients and queue worker.
+
+LocalLLMClient talks through InProcessLLMServer, which will be replaced
+by a Thrift server/client pair for remote GPU hosting.
+"""
 
 import copy
 import logging
 import queue
 import threading
-import time
 import uuid
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 
-import numpy as np
+import models
+
+from backend.llm_backend import LocalLLMBackend
+
+from .base import LLMClient, QueueItem
+from .gemini_utils import GEMINI_DEFAULT_MODEL, generate_gemini_response
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class QueueItem:
-    id: str
-    question: str
-    context_summary: str
-    history: list[dict]
-    status: str = "queued"  # queued | processing | ready | delivered
-    answer: str | None = None
-    timestamp: float = field(default_factory=time.time)
+# ---------------------------------------------------------------------------
+# Gemini (remote API)
+# ---------------------------------------------------------------------------
+class GeminiLLMClient(LLMClient):
 
+    def __init__(self, model_key: str | None = None):
+        self._model_key = model_key or GEMINI_DEFAULT_MODEL
 
-class LLMBackend(ABC):
-    """Abstract base class for LLM inference providers."""
-
-    @abstractmethod
     def generate(self, question: str, history: list[dict]) -> str:
-        """Generate a full response for the given question + history."""
-        ...
+        return generate_gemini_response(
+            model_key=self._model_key,
+            user_text=question,
+            history=history,
+            system_prompt=models.BACKEND_SYSTEM_PROMPT,
+            max_tokens=1024,
+        )
 
-    @abstractmethod
     def load_model(self, model_key: str) -> None:
-        """Load or switch the underlying model."""
-        ...
+        logger.info("GeminiLLMClient switching to model: %s", model_key)
+        self._model_key = model_key
 
-    @abstractmethod
     def unload_model(self) -> None:
-        """Free model resources."""
-        ...
+        pass
+
+    @property
+    def model_key(self) -> str | None:
+        return self._model_key
 
 
-class ASRBackend(ABC):
-    """Abstract base class for ASR providers."""
+# ---------------------------------------------------------------------------
+# Local (in-process server → backend)
+# ---------------------------------------------------------------------------
+class InProcessLLMServer:
+    """In-process server — direct method calls to the backend.
 
-    @abstractmethod
-    def transcribe(self, sr: int, audio_data: np.ndarray) -> str:
-        """Transcribe audio to text. audio_data is raw numpy from the mic."""
-        ...
+    TODO: Replace with Thrift server/client pair.
+    """
 
-    @abstractmethod
-    def load_model(self, model_key: str) -> None: ...
-
-    @abstractmethod
-    def unload_model(self) -> None: ...
-
-
-class BackendWorker:
-    """Manages a background thread that processes queued questions via an LLMBackend."""
-
-    def __init__(self, backend: LLMBackend):
+    def __init__(self, backend: LocalLLMBackend):
         self._backend = backend
+
+    def generate(self, question: str, history: list[dict]) -> str:
+        return self._backend.generate(question, history)
+
+    def load_model(self, model_key: str) -> None:
+        self._backend.load_model(model_key)
+
+    def unload_model(self) -> None:
+        self._backend.unload_model()
+
+    @property
+    def model_key(self) -> str | None:
+        return self._backend.model_key
+
+
+class LocalLLMClient(LLMClient):
+    """Client that talks to an LLM server. Orchestrator uses this."""
+
+    def __init__(self, model_key: str | None = None):
+        backend = LocalLLMBackend(model_key)
+        self._server = InProcessLLMServer(backend)
+
+    def generate(self, question: str, history: list[dict]) -> str:
+        return self._server.generate(question, history)
+
+    def load_model(self, model_key: str) -> None:
+        self._server.load_model(model_key)
+
+    def unload_model(self) -> None:
+        self._server.unload_model()
+
+    @property
+    def model_key(self) -> str | None:
+        return self._server.model_key
+
+
+# ---------------------------------------------------------------------------
+# Queue worker
+# ---------------------------------------------------------------------------
+class LLMQueueWorker:
+    """Manages a background thread that processes queued questions via an LLMClient."""
+
+    def __init__(self, client: LLMClient):
+        self._client = client
         self._task_queue: queue.Queue[QueueItem] = queue.Queue()
         self._result_queue: queue.Queue[QueueItem] = queue.Queue()
         self._items: dict[str, QueueItem] = {}
@@ -77,7 +117,7 @@ class BackendWorker:
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        logger.info("BackendWorker started")
+        logger.info("LLMQueueWorker started")
 
     def stop(self) -> None:
         self._running = False
@@ -94,7 +134,7 @@ class BackendWorker:
 
             logger.info("Processing item %s: %s", item.id, item.question[:60])
             try:
-                answer = self._backend.generate(item.question, item.history)
+                answer = self._client.generate(item.question, item.history)
                 with self._lock:
                     item.answer = answer
                     item.status = "ready"
@@ -160,9 +200,9 @@ class BackendWorker:
             except queue.Empty:
                 break
 
-    def swap_backend(self, new_backend: LLMBackend) -> None:
-        logger.info("Swapping backend, draining queue...")
+    def swap_client(self, new_client: LLMClient) -> None:
+        logger.info("Swapping LLM client, draining queue...")
         self._task_queue.join()
-        self._backend.unload_model()
-        self._backend = new_backend
-        logger.info("Backend swapped")
+        self._client.unload_model()
+        self._client = new_client
+        logger.info("LLM client swapped")

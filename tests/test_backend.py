@@ -1,6 +1,6 @@
 """Test the backend flow: delegation, processing, and result delivery.
 
-Tests the BackendWorker + Backend abstraction without any Gradio or frontend.
+Tests the LLMQueueWorker + Backend abstraction without any Gradio or frontend.
 
 Usage:
     ./run.sh python -m tests.test_backend
@@ -17,7 +17,7 @@ import threading
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from backend import Backend, BackendWorker, LocalBackend, QueueItem
+from client import LLMClient, LLMQueueWorker, LocalLLMClient, QueueItem
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Mock backend for fast testing (no GPU needed)
 # ---------------------------------------------------------------------------
-class MockBackend(Backend):
+class MockBackend(LLMClient):
     """A fake backend that returns canned responses after a short delay."""
 
     def __init__(self, delay: float = 1.0):
@@ -54,11 +54,11 @@ class MockBackend(Backend):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-def test_queue_lifecycle(backend: Backend):
+def test_queue_lifecycle(backend: LLMClient):
     """Test: submit → queued → processing → ready → delivered."""
     print("\n=== Test: Queue Lifecycle ===")
 
-    worker = BackendWorker(backend)
+    worker = LLMQueueWorker(backend)
     worker.start()
 
     # Submit a question
@@ -105,11 +105,11 @@ def test_queue_lifecycle(backend: Backend):
     print("  PASSED")
 
 
-def test_multiple_questions(backend: Backend):
+def test_multiple_questions(backend: LLMClient):
     """Test: multiple questions processed in order."""
     print("\n=== Test: Multiple Questions ===")
 
-    worker = BackendWorker(backend)
+    worker = LLMQueueWorker(backend)
     worker.start()
 
     questions = [
@@ -151,14 +151,14 @@ def test_multiple_questions(backend: Backend):
     print("  PASSED")
 
 
-def test_swap_backend():
+def test_swap_client():
     """Test: swapping backend while worker is running."""
     print("\n=== Test: Swap Backend ===")
 
     backend1 = MockBackend(delay=0.5)
     backend2 = MockBackend(delay=0.2)
 
-    worker = BackendWorker(backend1)
+    worker = LLMQueueWorker(backend1)
     worker.start()
 
     # Submit with backend1
@@ -172,7 +172,7 @@ def test_swap_backend():
     print(f"  Backend1 result: {results1[0].answer[:60]}")
 
     # Swap to backend2
-    worker.swap_backend(backend2)
+    worker.swap_client(backend2)
 
     # Submit with backend2
     item2 = worker.submit("Question for backend2", "q2 summary", [])
@@ -190,11 +190,11 @@ def test_swap_backend():
     print("  PASSED")
 
 
-def test_history_snapshot(backend: Backend):
+def test_history_snapshot(backend: LLMClient):
     """Test: history is snapshotted at submit time, not affected by later changes."""
     print("\n=== Test: History Snapshot ===")
 
-    worker = BackendWorker(backend)
+    worker = LLMQueueWorker(backend)
     worker.start()
 
     original_history = [
@@ -302,14 +302,14 @@ def main():
 
     if args.use_real_model:
         print(f"Using real model: {args.model}")
-        backend = LocalBackend(args.model)
+        backend = LocalLLMClient(args.model)
     else:
         print("Using MockBackend (pass --use-real-model for real model tests)")
         backend = MockBackend(delay=1.0)
 
     test_queue_lifecycle(backend)
     test_multiple_questions(backend)
-    test_swap_backend()  # always uses MockBackend
+    test_swap_client()  # always uses MockBackend
     test_history_snapshot(backend)
 
     if args.use_real_model:

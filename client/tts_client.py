@@ -1,4 +1,8 @@
-"""TTS backend abstractions and queue worker."""
+"""TTS clients and queue worker.
+
+No local TTS backend exists yet. When one is added, follow the same
+InProcessServer pattern used in llm_client.py and asr_client.py.
+"""
 
 import concurrent.futures
 import logging
@@ -9,12 +13,11 @@ import threading
 import time
 import uuid
 import wave
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from enum import Enum
 
 from google import genai
 from google.genai import types
+
+from .base import TTSClient, TTSQueueItem, TTSSource
 
 logger = logging.getLogger(__name__)
 
@@ -40,57 +43,7 @@ def _get_genai_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
-def _wav_duration(path: str) -> float:
-    """Return duration in seconds of a WAV file."""
-    try:
-        with wave.open(path) as wf:
-            return wf.getnframes() / wf.getframerate()
-    except Exception:
-        return 0.0
-
-
-class TTSSource(Enum):
-    FRONTEND = "frontend"
-    BACKEND = "backend"
-
-
-@dataclass
-class TTSQueueItem:
-    id: str
-    text: str
-    source: TTSSource
-    context: str = ""
-    status: str = "queued"  # queued | processing | ready | delivered
-    audio_path: str | None = None
-    audio_duration: float = 0.0
-    timestamp: float = field(default_factory=time.time)
-
-    @property
-    def is_immediate(self) -> bool:
-        return self.source == TTSSource.FRONTEND
-
-
-class TTSBackend(ABC):
-    """Abstract base class for TTS providers."""
-
-    @abstractmethod
-    def synthesize(self, text: str) -> str:
-        """Synthesize text to audio. Returns path to a WAV file."""
-        ...
-
-    @abstractmethod
-    def get_voices(self) -> list[str]:
-        """Return available voice names."""
-        ...
-
-    @abstractmethod
-    def set_voice(self, voice: str) -> None:
-        """Set the active voice."""
-        ...
-
-
-class GeminiTTSBackend(TTSBackend):
-    """Gemini TTS via the genai SDK."""
+class GeminiTTSClient(TTSClient):
 
     def __init__(self, voice: str = DEFAULT_TTS_VOICE):
         self._voice = voice
@@ -130,18 +83,27 @@ class GeminiTTSBackend(TTSBackend):
         logger.info("TTS voice set to %s", voice)
 
 
+# ---------------------------------------------------------------------------
+# Queue worker
+# ---------------------------------------------------------------------------
+def _wav_duration(path: str) -> float:
+    try:
+        with wave.open(path) as wf:
+            return wf.getnframes() / wf.getframerate()
+    except Exception:
+        return 0.0
+
+
 class TTSQueueWorker:
     """Manages TTS synthesis with a thread pool.
 
-    All submissions (frontend and backend) are synthesized concurrently
-    in a shared thread pool — no request blocks another.  Delivery is
-    serialized: ``get_next_audio()`` returns one item at a time, waits
-    for estimated playback to finish, and prioritizes immediate
-    (frontend) results over backend ones.
+    All submissions are synthesized concurrently. Delivery is serialized:
+    ``get_next_audio()`` returns one item at a time, waits for estimated
+    playback to finish, and prioritizes immediate (frontend) results.
     """
 
-    def __init__(self, backend: TTSBackend, max_workers: int = 4):
-        self._backend = backend
+    def __init__(self, client: TTSClient, max_workers: int = 4):
+        self._client = client
         self._max_workers = max_workers
         self._immediate_result_queue: queue.Queue[TTSQueueItem] = queue.Queue()
         self._backend_result_queue: queue.Queue[TTSQueueItem] = queue.Queue()
@@ -171,7 +133,7 @@ class TTSQueueWorker:
 
         logger.info("TTS processing %s [%s]: %s", item.id, item.source.value, item.text[:60])
         try:
-            audio_path = self._backend.synthesize(item.text)
+            audio_path = self._client.synthesize(item.text)
             duration = _wav_duration(audio_path)
             with self._lock:
                 item.audio_path = audio_path
@@ -204,12 +166,6 @@ class TTSQueueWorker:
         return item
 
     def get_next_audio(self) -> TTSQueueItem | None:
-        """Return at most one completed item for audio delivery.
-
-        Immediate results take priority.  Returns ``None`` if no results
-        are ready or if the previous audio is still estimated to be
-        playing (based on WAV duration).
-        """
         now = time.time()
         if now < self._last_delivered_at + self._last_delivered_duration:
             return None
@@ -230,7 +186,6 @@ class TTSQueueWorker:
         return item
 
     def has_pending_immediate(self) -> bool:
-        """True if any frontend-sourced item is not yet delivered."""
         with self._lock:
             return any(
                 item.is_immediate and item.status != "delivered"
