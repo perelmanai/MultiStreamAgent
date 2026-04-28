@@ -30,6 +30,7 @@ ssh -L 7863:localhost:7863 <user>@<devgpu>
 
 ## TODO
 
-- [ ] Add logic for choosing between actions: select and generate
-- [ ] Refactor into orchestrator
+- [x] Add logic for choosing between actions: select and generate
+- [x] Refactor into orchestrator
+- [ ] Set up Thrift server/client for Whisper ASR and Qwen LLM backends
 
