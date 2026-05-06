@@ -33,4 +33,6 @@ ssh -L 7863:localhost:7863 <user>@<devgpu>
 - [x] Add logic for choosing between actions: select and generate
 - [x] Refactor into orchestrator
 - [ ] Set up Thrift server/client for Whisper ASR and Qwen LLM backends
+- [ ] Make speech input blocking — user should not be able to send new messages while transcription is in progress
+- [ ] Visualize sub-agent spawning (show which agents are active, queued, and completed in the UI)
 
