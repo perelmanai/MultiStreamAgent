@@ -52,6 +52,14 @@ Local:    LocalLLMClient ────> InProcessLLMServer ────> LocalLLM
 
 Audio delivery is gated by browser playback state, not a duration timer. JavaScript hooks on the `<audio>` element's `play`, `pause`, and `ended` events write to a hidden flag. The poll function reads this flag and only delivers new audio when the previous clip has finished or been stopped.
 
+### Chatbox write serialization
+
+Multiple Gradio event handlers can target the chat component concurrently (text submit, speech submit, the 2-second timer poll). Without coordination Gradio's "last write wins" semantics cause streaming yields to clobber backend-ready notifications and concurrent submits to drop messages. The Orchestrator coordinates them:
+
+- **Busy gate** — `_process_text` (called by both `handle_user_message` and `handle_audio_input`) acquires a non-blocking busy lock. A second user-message call while one is in flight is rejected with a warning; history is left untouched.
+- **Deferred poll appends** — while busy, `poll()` still drains backend/TTS results into orchestrator state, but routes any new chat notifications into `_deferred_notifications` instead of appending to history. It returns `skip_chat_update=True` so the app emits `gr.update()` for the chat component, leaving the streaming generator's writes intact. The next non-busy poll flushes the deferred notifications in order.
+- **Input mode gate** — `handle_user_message` is a no-op when `input_mode != "Text"` and `handle_audio_input` is a no-op when `input_mode != "Speech"`. The hidden input component's events can still fire from Gradio's perspective but they no longer mutate history.
+
 ## Flow Diagram
 
 ```
