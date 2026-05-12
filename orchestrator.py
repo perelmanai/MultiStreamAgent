@@ -55,6 +55,10 @@ class OrchestratorUpdate:
     warning: str | None = None
     text_queue_count: int = 0
     speech_queue_count: int = 0
+    # True when the UI should NOT overwrite the chat component on this update.
+    # Used by ``poll`` while a user-message handler is mid-flight, to avoid
+    # racing the streaming generator's chat writes.
+    skip_chat_update: bool = False
 
 
 class Orchestrator:
@@ -80,6 +84,15 @@ class Orchestrator:
         self.tts_engine: GeminiTTSClient = GeminiTTSClient()
         self.tts_queue_worker: TTSQueueWorker | None = None
         self.output_mode: str = "Text"
+        self.input_mode: str = "Text"
+
+        # Busy gate: only one user-message handler may mutate the chat at a
+        # time. ``poll`` checks this and defers chat writes while busy.
+        self._busy_state_lock = threading.Lock()
+        self._busy_depth: int = 0
+        # Notifications collected by ``poll`` while busy; flushed on next
+        # non-busy poll.
+        self._deferred_notifications: list[str] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -145,11 +158,41 @@ class Orchestrator:
             return
         self.tts_queue_worker.submit(text, source=source)
 
+    def _try_acquire_busy(self) -> bool:
+        with self._busy_state_lock:
+            if self._busy_depth > 0:
+                return False
+            self._busy_depth += 1
+            return True
+
+    def _release_busy(self) -> None:
+        with self._busy_state_lock:
+            self._busy_depth = max(0, self._busy_depth - 1)
+
+    def is_busy(self) -> bool:
+        with self._busy_state_lock:
+            return self._busy_depth > 0
+
     # ------------------------------------------------------------------
     # Core flow
     # ------------------------------------------------------------------
 
     def handle_user_message(
+        self,
+        user_text: str,
+        history: list[dict],
+        threshold_n: int,
+        streaming_enabled: bool,
+        num_words_delay: int,
+    ) -> Generator[OrchestratorUpdate, None, None]:
+        if self.input_mode != "Text":
+            # Silently ignore text submits when UI is in speech mode.
+            return
+        yield from self._process_text(
+            user_text, history, threshold_n, streaming_enabled, num_words_delay
+        )
+
+    def _process_text(
         self,
         user_text: str,
         history: list[dict],
@@ -174,11 +217,38 @@ class Orchestrator:
             )
             return
 
+        if not self._try_acquire_busy():
+            yield self._make_update(
+                history,
+                warning=(
+                    "Please wait — the previous message is still being processed."
+                ),
+            )
+            return
+
+        try:
+            yield from self._process_text_locked(
+                user_text, history, threshold_n, streaming_enabled, num_words_delay
+            )
+        finally:
+            self._release_busy()
+
+    def _process_text_locked(
+        self,
+        user_text: str,
+        history: list[dict],
+        threshold_n: int,
+        streaming_enabled: bool,
+        num_words_delay: int,
+    ) -> Generator[OrchestratorUpdate, None, None]:
         using_gemini = self.frontend_type == "Gemini API"
 
         if not using_gemini and self.frontend_model is None:
             history.append(
-                {"role": "assistant", "content": "Models are still loading, please wait..."}
+                {
+                    "role": "assistant",
+                    "content": "Models are still loading, please wait...",
+                }
             )
             yield self._make_update(history, clear_input=True)
             return
@@ -198,9 +268,13 @@ class Orchestrator:
                     ready_items=ready_for_intent,
                 )
                 if intention["action"] == "SELECT":
-                    answer_text, audio_path = self._deliver_ready_item(intention["index"], history)
+                    answer_text, audio_path = self._deliver_ready_item(
+                        intention["index"], history
+                    )
                     if answer_text:
-                        yield self._make_update(history, clear_input=True, audio_path=audio_path)
+                        yield self._make_update(
+                            history, clear_input=True, audio_path=audio_path
+                        )
                         return
 
             is_complex, est_words, summary = self._gemini_triage(user_text, threshold_n)
@@ -277,7 +351,9 @@ class Orchestrator:
                 final_text = history[-1]["content"]
             else:
                 with self.frontend_lock:
-                    answer = generate_response(self.frontend_model, user_text, history[:-1])
+                    answer = generate_response(
+                        self.frontend_model, user_text, history[:-1]
+                    )
                 history.append({"role": "assistant", "content": answer})
                 final_text = answer
                 yield self._make_update(history, clear_input=True)
@@ -291,6 +367,20 @@ class Orchestrator:
 
     def poll(self, history: list[dict]) -> OrchestratorUpdate:
         audio_path = None
+        busy = self.is_busy()
+
+        # When not busy, flush any notifications that were deferred during a
+        # prior busy window before we process new results.
+        if not busy and self._deferred_notifications:
+            for text in self._deferred_notifications:
+                self._append_notification(history, text)
+            self._deferred_notifications.clear()
+
+        def queue_notification(text: str) -> None:
+            if busy:
+                self._deferred_notifications.append(text)
+            else:
+                self._append_notification(history, text)
 
         if self.backend_worker is not None:
             results = self.backend_worker.get_results()
@@ -314,10 +404,11 @@ class Orchestrator:
                     }
                     logger.info(
                         "Answer TTS enqueued %s for item %s (notification pending)",
-                        tts_item.id, item.id,
+                        tts_item.id,
+                        item.id,
                     )
                 else:
-                    self._append_notification(history, notification)
+                    queue_notification(notification)
 
         if self.tts_queue_worker is not None:
             tts_item = self.tts_queue_worker.get_next_audio()
@@ -326,10 +417,8 @@ class Orchestrator:
                     info = self._pending_notifications.pop(tts_item.id)
                     if tts_item.audio_path:
                         self._ready_audio[info["item_id"]] = tts_item.audio_path
-                    self._append_notification(history, info["text"])
-                    self.tts_queue_worker.submit(
-                        info["text"], source=TTSSource.BACKEND
-                    )
+                    queue_notification(info["text"])
+                    self.tts_queue_worker.submit(info["text"], source=TTSSource.BACKEND)
                     logger.info(
                         "Answer speech ready — notification sent for item %s, "
                         "audio stored for SELECT",
@@ -340,10 +429,12 @@ class Orchestrator:
                         audio_path = tts_item.audio_path
                 self.tts_queue_worker.mark_delivered(tts_item.id)
                 logger.info(
-                    "TTS item %s delivered (%.1fs)", tts_item.id, tts_item.audio_duration
+                    "TTS item %s delivered (%.1fs)",
+                    tts_item.id,
+                    tts_item.audio_duration,
                 )
 
-        return self._make_update(history, audio_path=audio_path)
+        return self._make_update(history, audio_path=audio_path, skip_chat_update=busy)
 
     def _get_ready_items_for_intent(self) -> list[dict]:
         """Build the ready-items list for intention estimation."""
@@ -357,7 +448,9 @@ class Orchestrator:
             for idx, item in enumerate(self._ready_items.values())
         ]
 
-    def _deliver_ready_item(self, index: int, history: list[dict]) -> tuple[str | None, str | None]:
+    def _deliver_ready_item(
+        self, index: int, history: list[dict]
+    ) -> tuple[str | None, str | None]:
         """Deliver a ready item by index. Returns (answer_text, audio_path)."""
         items_list = list(self._ready_items.values())
         if index < 0 or index >= len(items_list):
@@ -375,7 +468,12 @@ class Orchestrator:
         if self.backend_worker is not None:
             self.backend_worker.mark_delivered(item.id)
         del self._ready_items[item.id]
-        logger.info("Delivered ready item %s (index %d, audio=%s)", item.id, index, audio_path is not None)
+        logger.info(
+            "Delivered ready item %s (index %d, audio=%s)",
+            item.id,
+            index,
+            audio_path is not None,
+        )
         return item.answer, audio_path
 
     def handle_audio_input(
@@ -386,6 +484,9 @@ class Orchestrator:
         streaming_enabled: bool,
         num_words_delay: int,
     ) -> Generator[OrchestratorUpdate, None, None]:
+        if self.input_mode != "Speech":
+            # Silently ignore audio events when UI is in text mode.
+            return
         if audio_data is None:
             yield self._make_update(history, status_message="Ready to record")
             return
@@ -400,7 +501,9 @@ class Orchestrator:
             yield self._make_update(history, status_message="(no speech detected)")
             return
 
-        for update in self.handle_user_message(
+        # Bypass the input-mode gate on _process_text — we already validated
+        # that we are in speech mode above.
+        for update in self._process_text(
             transcript, history, threshold_n, streaming_enabled, num_words_delay
         ):
             update.status_message = f"Sent: {transcript[:80]}"
@@ -414,13 +517,20 @@ class Orchestrator:
         self._ready_items.clear()
         self._ready_audio.clear()
         self._pending_notifications.clear()
+        self._deferred_notifications.clear()
         return self._make_update([])
+
+    def set_input_mode(self, mode: str) -> None:
+        self.input_mode = mode
+        logger.info("Input mode switched to %s", mode)
 
     # ------------------------------------------------------------------
     # Configuration
     # ------------------------------------------------------------------
 
-    def set_frontend_type(self, fe_type: str, local_model_key: str, gemini_model_key: str) -> str:
+    def set_frontend_type(
+        self, fe_type: str, local_model_key: str, gemini_model_key: str
+    ) -> str:
         self.frontend_type = fe_type
 
         if fe_type == "Gemini API":
@@ -456,7 +566,9 @@ class Orchestrator:
         logger.info("Frontend Gemini model switched to %s", model_key)
         return f"Frontend Gemini model switched to {model_key}."
 
-    def set_backend_type(self, be_type: str, local_model_key: str, gemini_model_key: str) -> str:
+    def set_backend_type(
+        self, be_type: str, local_model_key: str, gemini_model_key: str
+    ) -> str:
         if be_type == "Gemini API":
             new_client = GeminiLLMClient(model_key=gemini_model_key)
             label = f"Gemini ({gemini_model_key})"

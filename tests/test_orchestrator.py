@@ -328,16 +328,22 @@ class MockTTSClient(TTSClient):
         pass
 
 
-def _wait_for_tts_ready(orch: Orchestrator, source_filter: TTSSource | None, timeout: float = 10.0):
+def _wait_for_tts_ready(
+    orch: Orchestrator, source_filter: TTSSource | None, timeout: float = 10.0
+):
     """Wait until a TTS item with the given source is ready."""
     start = time.time()
     while time.time() - start < timeout:
         items = orch.tts_queue_worker.get_all_items()
         for item in items:
-            if item.status == "ready" and (source_filter is None or item.source == source_filter):
+            if item.status == "ready" and (
+                source_filter is None or item.source == source_filter
+            ):
                 return item
         time.sleep(0.1)
-    statuses = [(i.id, i.source.value, i.status) for i in orch.tts_queue_worker.get_all_items()]
+    statuses = [
+        (i.id, i.source.value, i.status) for i in orch.tts_queue_worker.get_all_items()
+    ]
     raise TimeoutError(f"No TTS item ready after {timeout}s. Items: {statuses}")
 
 
@@ -386,7 +392,9 @@ def test_speech_mode_notification_deferred():
     print("  Step 1: Simple question")
     _drain(orch.handle_user_message("What is 2 + 2?", history, 50, False, 3))
     assert any(m["role"] == "assistant" for m in history)
-    print(f"    Answer: {[m for m in history if m['role'] == 'assistant'][-1]['content'][:50]}...")
+    print(
+        f"    Answer: {[m for m in history if m['role'] == 'assistant'][-1]['content'][:50]}..."
+    )
 
     # Drain the simple answer audio
     _wait_for_tts_ready(orch, TTSSource.FRONTEND)
@@ -401,7 +409,11 @@ def test_speech_mode_notification_deferred():
         "on developing nations, including case studies from Africa and Southeast Asia."
     )
     _drain(orch.handle_user_message(complex_q, history, 50, False, 3))
-    relay = [m for m in history if m["role"] == "assistant" and "I'll work on" in m["content"]]
+    relay = [
+        m
+        for m in history
+        if m["role"] == "assistant" and "I'll work on" in m["content"]
+    ]
     assert len(relay) >= 1
     print(f"    Relay: {relay[-1]['content'][:60]}...")
 
@@ -425,27 +437,35 @@ def test_speech_mode_notification_deferred():
     # At this point, answer TTS is enqueued but may not be ready yet.
     # The notification should NOT be in history yet (it's pending).
     notifications_now = [
-        m for m in history
+        m
+        for m in history
         if m["role"] == "assistant" and "finished working" in m["content"]
     ]
     # The notification might already appear if TTS was fast, so check pending count
     pending_count = len(orch._pending_notifications)
-    print(f"    Ready items: {len(orch._ready_items)}, pending notifications: {pending_count}")
+    print(
+        f"    Ready items: {len(orch._ready_items)}, pending notifications: {pending_count}"
+    )
     print(f"    Text notifications in history so far: {len(notifications_now)}")
 
     # --- Step 4: Keep polling — answer TTS becomes ready → notification appears ---
     print("  Step 4: Answer TTS ready → notification sent (text + speech)")
 
     def has_notification(h):
-        return any(m["role"] == "assistant" and "finished working" in m["content"] for m in h)
+        return any(
+            m["role"] == "assistant" and "finished working" in m["content"] for m in h
+        )
 
     _poll_until(orch, history, has_notification)
 
     notifications = [
-        m for m in history
+        m
+        for m in history
         if m["role"] == "assistant" and "finished working" in m["content"]
     ]
-    assert len(notifications) >= 1, "Notification should appear after answer TTS is ready"
+    assert (
+        len(notifications) >= 1
+    ), "Notification should appear after answer TTS is ready"
     print(f"    Notification: {notifications[-1]['content'][:70]}...")
 
     # Notification speech should also be enqueued
@@ -454,7 +474,9 @@ def test_speech_mode_notification_deferred():
     assert len(notification_tts) >= 1, "Notification speech should be enqueued"
     print(f"    Notification TTS enqueued: {notification_tts[0].text[:50]}...")
 
-    assert len(orch._pending_notifications) == 0, "No pending notifications should remain"
+    assert (
+        len(orch._pending_notifications) == 0
+    ), "No pending notifications should remain"
     print("    All pending notifications resolved")
 
     # --- Step 5: User selects the answer ---
@@ -468,15 +490,20 @@ def test_speech_mode_notification_deferred():
             break
 
     # Verify answer audio is stored for SELECT
-    assert len(orch._ready_audio) >= 1, f"Expected stored answer audio, got {len(orch._ready_audio)}"
+    assert (
+        len(orch._ready_audio) >= 1
+    ), f"Expected stored answer audio, got {len(orch._ready_audio)}"
     print(f"    Answer audio stored: {list(orch._ready_audio.values())}")
 
-    updates = _drain(orch.handle_user_message(
-        "Yes, tell me the answer about renewable energy", history, 50, False, 3
-    ))
+    updates = _drain(
+        orch.handle_user_message(
+            "Yes, tell me the answer about renewable energy", history, 50, False, 3
+        )
+    )
 
     delivered = [
-        m for m in history
+        m
+        for m in history
         if m["role"] == "assistant" and "Regarding your question" in m["content"]
     ]
     if delivered:
@@ -486,7 +513,9 @@ def test_speech_mode_notification_deferred():
 
         # The SELECT update should include the audio_path
         select_updates = [u for u in updates if u.audio_path]
-        assert len(select_updates) >= 1, "SELECT should deliver audio_path with the text"
+        assert (
+            len(select_updates) >= 1
+        ), "SELECT should deliver audio_path with the text"
         print(f"    Audio delivered with SELECT: {select_updates[0].audio_path}")
 
         assert len(orch._ready_audio) == 0, "Audio should be consumed after SELECT"
@@ -518,7 +547,11 @@ def test_text_mode_notification_immediate():
         "on developing nations, including case studies from Africa and Southeast Asia."
     )
     _drain(orch.handle_user_message(complex_q, history, 50, False, 3))
-    relay = [m for m in history if m["role"] == "assistant" and "I'll work on" in m["content"]]
+    relay = [
+        m
+        for m in history
+        if m["role"] == "assistant" and "I'll work on" in m["content"]
+    ]
     assert len(relay) >= 1
     print(f"  Relay: {relay[-1]['content'][:60]}...")
 
@@ -528,7 +561,8 @@ def test_text_mode_notification_immediate():
 
     # Notification should appear immediately in text mode
     notifications = [
-        m for m in history
+        m
+        for m in history
         if m["role"] == "assistant" and "finished working" in m["content"]
     ]
     assert len(notifications) >= 1, "Text mode: notification should appear immediately"
@@ -537,6 +571,137 @@ def test_text_mode_notification_immediate():
     # No pending notifications in text mode
     assert len(orch._pending_notifications) == 0
     print("  No pending notifications (text mode sends immediately)")
+
+    orch.backend_worker.stop()
+    print("  PASSED")
+
+
+# ---------------------------------------------------------------------------
+# Race-condition fix tests (no network — pure orchestrator state checks)
+# ---------------------------------------------------------------------------
+def test_input_mode_gates_text_submit_in_speech_mode():
+    """In Speech input mode, handle_user_message must silently ignore text submits."""
+    print("\n=== Test: Input mode gates text submit in speech mode ===")
+
+    orch = _make_orchestrator()
+    orch.set_input_mode("Speech")
+    history: list[dict] = []
+
+    updates = _drain(orch.handle_user_message("hello", history, 50, False, 3))
+
+    assert updates == [], f"expected no updates, got {len(updates)}"
+    assert history == [], f"history should be untouched, got {history}"
+    assert not orch.is_busy(), "busy flag should not have been acquired"
+
+    orch.backend_worker.stop()
+    print("  PASSED")
+
+
+def test_input_mode_gates_audio_in_text_mode():
+    """In Text input mode, handle_audio_input must silently ignore audio events."""
+    print("\n=== Test: Input mode gates audio events in text mode ===")
+
+    import numpy as np
+
+    orch = _make_orchestrator()
+    orch.set_input_mode("Text")  # default
+    history: list[dict] = []
+
+    fake_audio = (16000, np.zeros(16000, dtype=np.int16))
+    updates = _drain(orch.handle_audio_input(fake_audio, history, 50, False, 3))
+
+    assert updates == [], f"expected no updates, got {len(updates)}"
+    assert history == [], f"history should be untouched, got {history}"
+
+    orch.backend_worker.stop()
+    print("  PASSED")
+
+
+def test_busy_lock_rejects_concurrent_message():
+    """While one handle_user_message is in flight, a second call gets a warning."""
+    print("\n=== Test: Busy lock rejects concurrent user-message ===")
+
+    orch = _make_orchestrator()
+    # Force a non-Gemini path so we don't hit network; just acquire the lock
+    # directly to simulate an in-flight handler.
+    assert orch._try_acquire_busy(), "should acquire initially"
+    try:
+        history: list[dict] = []
+        updates = _drain(
+            orch.handle_user_message("second message", history, 50, False, 3)
+        )
+        warnings = [u for u in updates if u.warning]
+        assert len(warnings) == 1, f"expected 1 warning, got {warnings}"
+        assert "still being processed" in warnings[0].warning
+        assert history == [], "history should not be modified for rejected call"
+    finally:
+        orch._release_busy()
+
+    assert not orch.is_busy()
+    orch.backend_worker.stop()
+    print("  PASSED")
+
+
+def test_poll_defers_notification_when_busy():
+    """poll() should defer chat appends + set skip_chat_update while busy."""
+    print("\n=== Test: poll defers notifications while busy ===")
+
+    orch = _make_orchestrator(backend_delay=0.2)
+    orch.output_mode = "Text"
+    history: list[dict] = []
+
+    # Inject a fake ready item into the backend worker's result queue
+    # directly, so we don't depend on Gemini.
+    fake = QueueItem(
+        id="fake1",
+        question="What is foo?",
+        context_summary="foo concept",
+        history=[],
+        answer="Foo is a placeholder.",
+        status="ready",
+    )
+    orch.backend_worker._items[fake.id] = fake
+    orch.backend_worker._result_queue.put(fake)
+
+    # Simulate a user-message handler in flight.
+    assert orch._try_acquire_busy()
+    try:
+        update = orch.poll(history)
+        assert update.skip_chat_update, "poll must skip chat update when busy"
+        assert not any(
+            "finished working" in m.get("content", "") for m in history
+        ), "no notification should be appended while busy"
+        assert len(orch._deferred_notifications) == 1, (
+            f"expected 1 deferred notification, got "
+            f"{len(orch._deferred_notifications)}"
+        )
+        assert "finished working" in orch._deferred_notifications[0]
+        # Ready item bookkeeping should still happen so SELECT works later.
+        assert fake.id in orch._ready_items
+    finally:
+        orch._release_busy()
+
+    # Next poll while not busy must flush deferred notifications.
+    update = orch.poll(history)
+    assert not update.skip_chat_update
+    notifications = [m for m in history if "finished working" in m.get("content", "")]
+    assert len(notifications) == 1, f"expected flushed notification, got {history}"
+    assert orch._deferred_notifications == []
+
+    orch.backend_worker.stop()
+    print("  PASSED")
+
+
+def test_clear_drops_deferred_notifications():
+    """clear() must wipe deferred notifications so they don't leak across sessions."""
+    print("\n=== Test: clear() wipes deferred notifications ===")
+
+    orch = _make_orchestrator()
+    orch._deferred_notifications.append("stale notification")
+
+    update = orch.clear()
+    assert orch._deferred_notifications == []
+    assert update.history == []
 
     orch.backend_worker.stop()
     print("  PASSED")
@@ -553,6 +718,11 @@ def main():
     test_two_complex_then_select_each()
     test_text_mode_notification_immediate()
     test_speech_mode_notification_deferred()
+    test_input_mode_gates_text_submit_in_speech_mode()
+    test_input_mode_gates_audio_in_text_mode()
+    test_busy_lock_rejects_concurrent_message()
+    test_poll_defers_notification_when_busy()
+    test_clear_drops_deferred_notifications()
     print("\n=== All orchestrator tests passed! ===")
 
 

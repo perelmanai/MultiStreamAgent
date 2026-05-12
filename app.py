@@ -256,8 +256,11 @@ def poll_backend_and_tts(history: list[dict], audio_flag: str):
     audio_out = gr.update()
     if update.audio_path and not is_playing:
         audio_out = update.audio_path
+    # When a user-message handler is mid-flight, avoid overwriting the chat
+    # component — its streaming yields are the source of truth.
+    chat_out = gr.update() if update.skip_chat_update else update.history
     return (
-        update.history,
+        chat_out,
         gr.update(value=f"Text Queue ({update.text_queue_count})"),
         gr.update(value=f"Speech Queue ({update.speech_queue_count})"),
         render_text_queue_html(),
@@ -357,6 +360,7 @@ def on_asr_gemini_model_change(model_key: str):
 
 
 def on_input_mode_change(mode: str):
+    orch.set_input_mode(mode)
     return (
         gr.update(visible=mode == "Text"),
         gr.update(visible=mode == "Speech"),
@@ -425,7 +429,9 @@ def main():
     }
     """
 
-    with gr.Blocks(title="Multi-Stream Conversation", css=QUEUE_PANEL_CSS, js=audio_tracking_js) as demo:
+    with gr.Blocks(
+        title="Multi-Stream Conversation", css=QUEUE_PANEL_CSS, js=audio_tracking_js
+    ) as demo:
         gr.Markdown(
             "# Multi-Stream Conversation\nFront-end triage + back-end deep processing"
         )
@@ -547,7 +553,9 @@ def main():
                     elem_id="tts-audio-output",
                 )
                 audio_playing_flag = gr.Textbox(
-                    value="idle", visible=False, elem_id="audio-playing-flag",
+                    value="idle",
+                    visible=False,
+                    elem_id="audio-playing-flag",
                 )
                 with gr.Row(visible=True) as text_input_group:
                     text_input = gr.Textbox(
